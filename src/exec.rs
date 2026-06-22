@@ -1,6 +1,9 @@
+use crate::error::AshError;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Shell allowlist — only these binaries are trusted as `-c` interpreters.
+/// Compared against the canonicalized path to prevent symlink bypass.
 const ALLOWED_SHELLS: &[&str] = &[
     "/bin/sh",
     "/bin/bash",
@@ -9,24 +12,44 @@ const ALLOWED_SHELLS: &[&str] = &[
     "/bin/zsh",
 ];
 
+/// Resolve $SHELL to a canonicalized path and validate against the allowlist.
+/// No fallback — if $SHELL is unset, uncanonicalizable, or not allowlisted,
+/// return an error. The caller must surface it, never silently substitute.
+fn resolve_shell() -> Result<PathBuf, AshError> {
+    let shell = std::env::var("SHELL")
+        .map_err(|_| AshError::ShellNotAllowlisted("SHELL environment variable not set".into()))?;
+    let canon = std::fs::canonicalize(&shell).map_err(|e| {
+        AshError::ShellNotAllowlisted(format!("cannot canonicalize SHELL={shell}: {e}"))
+    })?;
+    let canon_str = canon.to_str().ok_or_else(|| {
+        AshError::ShellNotAllowlisted(format!(
+            "canonicalized SHELL path is not valid UTF-8: {}",
+            canon.display()
+        ))
+    })?;
+    if !ALLOWED_SHELLS.contains(&canon_str) {
+        return Err(AshError::ShellNotAllowlisted(format!(
+            "SHELL {shell} (canonicalized: {canon_str}) is not in the allowlist"
+        )));
+    }
+    Ok(canon)
+}
+
 /// Run a shell command, inheriting stdio, returning the child exit status.
 ///
-/// `$SHELL` is validated against an allowlist and falls back to `/bin/sh`
-/// to prevent environment-variable injection of arbitrary binaries.
+/// `$SHELL` is canonicalized and validated against an allowlist.
 /// `-i` is intentionally omitted to prevent alias/function shadowing of audited commands.
-/// Note: the audit in `risk.rs` checks binary names only — it does not inspect arguments.
 /// exec intentionally does not re-audit; the caller is responsible for running audit first.
-pub fn run(command: &str) -> i32 {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|s| ALLOWED_SHELLS.contains(&s.as_str()))
-        .unwrap_or_else(|| "/bin/sh".into());
-    Command::new(&shell)
+pub fn run(command: &str) -> Result<i32, AshError> {
+    let shell = resolve_shell()?;
+    let status = Command::new(&shell)
         .arg("-c")
         .arg(command)
         .status()
-        .map(|s| s.code().unwrap_or(1))
-        .unwrap_or(1)
+        .map_err(|e| AshError::ExecError(format!("cannot execute shell: {e}")))?;
+    status
+        .code()
+        .ok_or_else(|| AshError::ExecError("process terminated by signal".into()))
 }
 
 /// Print the shell-quoted command to stdout for manual inspection and re-use.

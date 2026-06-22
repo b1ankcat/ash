@@ -3,9 +3,8 @@
 # The API key may alternatively be supplied via the ASH_API_KEY environment variable.
 
 # Required
-provider_name = "openai"          # human-readable provider label
 api_type      = "openai"          # openai | anthropic | gemini | ollama | groq | cohere | deepseek | xai
-api_key       = "sk-..."          # your API key (or leave blank and set ASH_API_KEY)
+api_key       = "sk-..."          # your API key (or omit and set ASH_API_KEY env var)
 model_name    = "gpt-4o-mini"     # model to use
 
 # Optional: override the default API endpoint (e.g. for proxies or local models)
@@ -17,9 +16,11 @@ allow_list = ["ls", "cat", "git", "echo", "curl"]
 # Commands that are always rejected (deny wins over allow if a command appears in both)
 deny_list = ["rm", "sudo", "dd", "mkfs"]
 
-# When true (default): silently reject denied commands and exit 1 without showing the UI.
-# When false: show the high-risk UI and require double-confirmation before executing.
-# silent_reject = true
+# LLM request timeout in seconds (default: 60)
+# request_timeout_secs = 60
+
+# Tools to probe in PATH and include in LLM context (default: git, curl, docker, python3, node, cargo, make)
+# tools_to_probe = ["git", "curl", "docker", "python3", "node", "cargo", "make"]
 
 # Include OS, architecture, and current working directory in the LLM prompt context.
 # Note: cwd may reveal internal path structure to the LLM API.

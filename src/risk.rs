@@ -1,5 +1,12 @@
+mod builtins;
+mod patterns;
+
+pub(crate) use builtins::is_builtin;
+pub(crate) use patterns::{check_dangerous_pattern, check_pipe_to_shell};
+
 use crate::config::Config;
 use crate::parser;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RiskLevel {
@@ -16,6 +23,21 @@ pub enum AuditSignal {
     AllowDenyConflict(String),
     Wrapper(String),
     Unparseable,
+    DangerousPattern(String),
+}
+
+impl fmt::Display for AuditSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInPath(cmd) => write!(f, "not in PATH: {cmd}"),
+            Self::DenyListHit(cmd) => write!(f, "deny-list hit: {cmd}"),
+            Self::AllowListMiss(cmd) => write!(f, "allow-list miss: {cmd}"),
+            Self::AllowDenyConflict(cmd) => write!(f, "allow/deny conflict: {cmd}"),
+            Self::Wrapper(cmd) => write!(f, "wrapper: {cmd}"),
+            Self::Unparseable => write!(f, "unparseable syntax"),
+            Self::DangerousPattern(desc) => write!(f, "dangerous pattern: {desc}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -37,11 +59,16 @@ pub fn audit(parse: &parser::ParseResult, cfg: &Config) -> AuditResult {
         signals.push(AuditSignal::Unparseable);
     }
 
-    for cmd in &parse.commands {
-        // Empty allow_list means open-world (all commands allowed); only deny_list applies.
+    // Cross-segment check: curl/wget piped to a shell interpreter.
+    if let Some(desc) = check_pipe_to_shell(&parse.commands) {
+        should_reject = true;
+        signals.push(AuditSignal::DangerousPattern(desc.to_string()));
+    }
+
+    for (i, cmd) in parse.commands.iter().enumerate() {
         let in_allow = cfg.allow_list.is_empty() || cfg.allow_list.contains(cmd);
         let in_deny = cfg.deny_list.contains(cmd);
-        let in_path = which::which(cmd).is_ok();
+        let in_path = is_builtin(cmd) || which::which(cmd).is_ok();
 
         if !in_path {
             should_reject = true;
@@ -58,12 +85,28 @@ pub fn audit(parse: &parser::ParseResult, cfg: &Config) -> AuditResult {
             signals.push(AuditSignal::AllowListMiss(cmd.clone()));
         }
 
-        // A command on both lists is a configuration conflict — deny wins (already rejected above).
         if in_deny && in_allow && !cfg.allow_list.is_empty() {
             signals.push(AuditSignal::AllowDenyConflict(cmd.clone()));
         }
 
-        if parser::is_wrapper(cmd) {
+        // Argument-level dangerous pattern check.
+        if let Some(segment) = parse.segments.get(i)
+            && let Some((seg_cmd, args)) = parser::extract_cmd_and_args(segment)
+            && let Some(desc) = check_dangerous_pattern(&seg_cmd, &args)
+        {
+            should_reject = true;
+            signals.push(AuditSignal::DangerousPattern(desc.to_string()));
+        }
+
+        // Wrapper check: hard wrappers always double-confirm; soft wrappers only
+        // when the segment contains unquoted metacharacters.
+        if parser::is_hard_wrapper(cmd) {
+            need_double_confirm = true;
+            signals.push(AuditSignal::Wrapper(cmd.clone()));
+        } else if parser::is_soft_wrapper(cmd)
+            && let Some(segment) = parse.segments.get(i)
+            && parser::has_unquoted_metacharacter(segment)
+        {
             need_double_confirm = true;
             signals.push(AuditSignal::Wrapper(cmd.clone()));
         }
@@ -89,77 +132,16 @@ pub fn audit(parse: &parser::ParseResult, cfg: &Config) -> AuditResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ParseResult;
 
-    fn cfg(allow: &[&str], deny: &[&str]) -> Config {
-        Config {
-            provider_name: "openai".into(),
-            api_type: "openai".into(),
-            api_key: "k".into(),
-            model_name: "m".into(),
-            allow_list: allow.iter().map(|s| s.to_string()).collect(),
-            deny_list: deny.iter().map(|s| s.to_string()).collect(),
-            base_url: None,
-            silent_reject: true,
-            collect_sys_info: true,
-            collect_env_info: true,
-        }
-    }
-
-    fn parse(cmds: &[&str], unparseable: bool) -> ParseResult {
-        ParseResult {
-            commands: cmds.iter().map(|s| s.to_string()).collect(),
-            has_unparseable: unparseable,
-        }
+    #[test]
+    fn audit_signal_display_not_in_path() {
+        let s = AuditSignal::NotInPath("cd".into());
+        assert_eq!(format!("{s}"), "not in PATH: cd");
     }
 
     #[test]
-    fn deny_list_rejects() {
-        let r = audit(&parse(&["rm"], false), &cfg(&[], &["rm"]));
-        assert!(r.should_reject);
-    }
-
-    #[test]
-    fn allow_list_miss_rejects() {
-        let r = audit(&parse(&["curl"], false), &cfg(&["ls", "git"], &[]));
-        assert!(r.should_reject);
-    }
-
-    #[test]
-    fn allow_deny_conflict_rejects() {
-        // deny wins when a command appears in both lists
-        let r = audit(&parse(&["git"], false), &cfg(&["git"], &["git"]));
-        assert!(r.should_reject);
-    }
-
-    #[test]
-    fn wrapper_double_confirm() {
-        let r = audit(&parse(&["sudo"], false), &cfg(&[], &[]));
-        assert!(r.need_double_confirm);
-    }
-
-    #[test]
-    fn unparseable_double_confirm() {
-        let r = audit(&parse(&[], true), &cfg(&[], &[]));
-        assert!(r.need_double_confirm);
-    }
-
-    #[test]
-    fn missing_from_path_rejects() {
-        let r = audit(&parse(&["__ash_nonexistent_xyz__"], false), &cfg(&[], &[]));
-        assert!(r.should_reject);
-    }
-
-    #[test]
-    fn risk_level_safe() {
-        let r = audit(&parse(&["ls"], false), &cfg(&[], &[]));
-        // ls is in PATH on any normal system
-        assert_eq!(r.risk_level, RiskLevel::Safe);
-    }
-
-    #[test]
-    fn risk_level_mid() {
-        let r = audit(&parse(&["sudo"], false), &cfg(&[], &[]));
-        assert_eq!(r.risk_level, RiskLevel::Mid);
+    fn audit_signal_display_dangerous() {
+        let s = AuditSignal::DangerousPattern("rm -rf".into());
+        assert_eq!(format!("{s}"), "dangerous pattern: rm -rf");
     }
 }

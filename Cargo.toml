@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-genai = "0.7.0-beta.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+genai = "0.7.0-beta.4"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-dirs = "5"
-crossterm = "0.28"
-shlex = "1"
-which = "6"
+dirs = "6"
+crossterm = "0.29"
+shlex = "2"
+which = "8"
 
 [dev-dependencies]
 tempfile = "3"

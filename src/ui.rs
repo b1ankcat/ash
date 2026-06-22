@@ -24,9 +24,9 @@ pub enum MenuResult {
 }
 
 pub struct UiContext {
-    pub tokens_in: Option<i32>,
-    pub tokens_out: Option<i32>,
-    pub tokens_total: Option<i32>,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+    pub tokens_total: Option<i64>,
     pub risk_level: RiskLevel,
 }
 
@@ -136,9 +136,9 @@ fn print_header(
         Print("\n")
     )?;
 
-    let fmt = |n: Option<i32>| n.map_or_else(|| "-".to_string(), |v| v.to_string());
+    let fmt = |n: Option<i64>| n.map_or_else(|| "-".to_string(), |v| v.to_string());
     let (risk_color, risk_label) = match ctx.risk_level {
-        RiskLevel::Safe => (Color::Green, "safe risk"),
+        RiskLevel::Safe => (Color::DarkGrey, "audited"),
         RiskLevel::Mid => (Color::Yellow, "mid risk"),
         RiskLevel::High => (Color::Red, "high risk"),
     };

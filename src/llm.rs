@@ -5,6 +5,7 @@ use genai::Client;
 use genai::chat::{ChatMessage, ChatRequest, Usage};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use serde::Deserialize;
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Deserialize)]
 pub struct LlmDraft {
@@ -38,33 +39,80 @@ pub async fn generate(
     );
     let req = ChatRequest::new(vec![ChatMessage::system(system), ChatMessage::user(prompt)]);
 
-    let response = client
-        .exec_chat(&cfg.model_name, req, None)
-        .await
-        .map_err(|e| AshError::NetworkError(e.to_string()))?;
+    let response = timeout(
+        Duration::from_secs(cfg.request_timeout_secs),
+        client.exec_chat(&cfg.model_name, req, None),
+    )
+    .await
+    .map_err(|_| {
+        AshError::Timeout(format!(
+            "request timed out after {}s",
+            cfg.request_timeout_secs
+        ))
+    })?
+    .map_err(|e| AshError::NetworkError(e.to_string()))?;
 
     let usage = response.usage.clone();
-    let text = response.first_text().unwrap_or("").trim().to_string();
+    let text = response
+        .first_text()
+        .ok_or_else(|| AshError::LlmOutputError("no text in response".into()))?
+        .trim()
+        .to_string();
     let draft = parse_draft(&text)?;
     Ok((draft, usage))
 }
 
 fn parse_draft(text: &str) -> Result<LlmDraft, AshError> {
-    // Locate the outermost { … } span. rfind('}') is intentional: it finds the last
-    // closing brace so that any trailing prose ("Here you go!") after the JSON is excluded,
-    // while still correctly handling shell brace expansion inside string values.
     let no_json = || AshError::LlmOutputError("no JSON object in response".into());
     let start = text.find('{').ok_or_else(no_json)?;
-    let end = text.rfind('}').ok_or_else(no_json)?;
-    let json = &text[start..=end];
-
+    let json = extract_json(&text[start..]).ok_or_else(no_json)?;
     let draft: LlmDraft = serde_json::from_str(json)
         .map_err(|e| AshError::LlmOutputError(format!("invalid JSON: {e}")))?;
-
     if draft.command.trim().is_empty() {
         return Err(AshError::LlmOutputError("command is empty".into()));
     }
     Ok(draft)
+}
+
+/// Extract the first complete JSON object span using a brace-depth counter
+/// that respects JSON string escaping. More robust than rfind('}') which
+/// breaks on trailing prose containing literal braces.
+fn extract_json(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = 0;
+    let mut found_start = false;
+    for (i, c) in s.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = i;
+                    found_start = true;
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 && found_start {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn build_client(cfg: &Config) -> Result<Client, AshError> {
@@ -131,5 +179,24 @@ mod tests {
     fn trailing_prose_stripped() {
         let d = parse_draft(r#"Here you go: {"command":"ls"} Hope that helps!"#).unwrap();
         assert_eq!(d.command, "ls");
+    }
+
+    #[test]
+    fn trailing_prose_with_brace_stripped() {
+        // Trailing prose containing a literal } must not confuse the parser.
+        let d = parse_draft(r#"{"command":"ls"} oops } done"#).unwrap();
+        assert_eq!(d.command, "ls");
+    }
+
+    #[test]
+    fn nested_braces_in_string() {
+        let d = parse_draft(r#"{"command":"echo {test}","explanation":"x"}"#).unwrap();
+        assert_eq!(d.command, "echo {test}");
+    }
+
+    #[test]
+    fn escaped_quote_in_string() {
+        let d = parse_draft(r#"{"command":"echo \"hello\"","explanation":"x"}"#).unwrap();
+        assert_eq!(d.command, r#"echo "hello""#);
     }
 }
