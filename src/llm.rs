@@ -247,7 +247,8 @@ fn build_client(cfg: &Config) -> Result<Client, AshError> {
                 Ok(st)
             },
         ))
-        .build();
+        .build()
+        .map_err(|e| AshError::NetworkError(format!("failed to build LLM client: {e}")))?;
 
     Ok(client)
 }
