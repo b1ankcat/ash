@@ -60,9 +60,9 @@ cp config.toml.example ~/.config/ash/config.toml
 ```
 
 ```toml
-api_type      = "deepseek"
+api_type      = "openai"
 api_key       = "sk-..."       # or set ASH_API_KEY env var (or omit if env set)
-model_name    = "deepseek-chat"
+model_name    = "gpt-5.6"
 
 allow_list = []                # empty = all commands allowed
 deny_list  = ["rm", "sudo", "dd", "mkfs"]
@@ -75,9 +75,12 @@ deny_list  = ["rm", "sudo", "dd", "mkfs"]
 
 **Supported providers:** `openai` · `anthropic` · `gemini` · `ollama` · `groq` · `cohere` · `deepseek` · `xai`
 
-**API key via environment variable:**
+OpenAI GPT-5 family models automatically use the Responses API with strict JSON Schema output. Set `ASH_OPENAI_API_MODE=chat` to force the legacy Chat Completions route, or `ASH_REASONING_EFFORT=low|medium|high` to tune reasoning. Other providers retain genai's multi-provider chat adapter.
+
+**API key via environment variable** (`ASH_API_KEY` takes precedence; provider-specific names are also supported):
 ```bash
 export ASH_API_KEY="sk-..."
+# or OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / ...
 ```
 
 ---

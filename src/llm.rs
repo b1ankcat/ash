@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::env_probe::EnvSummary;
 use crate::error::AshError;
 use genai::Client;
-use genai::chat::{ChatMessage, ChatRequest, Usage};
+use genai::chat::{ChatMessage, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use serde::Deserialize;
 use tokio::time::{timeout, Duration};
@@ -13,11 +13,24 @@ pub struct LlmDraft {
     pub explanation: Option<String>,
 }
 
+/// Provider-neutral token accounting used by the UI. Keeping this type local
+/// avoids coupling callers to a specific provider SDK's usage schema.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
 pub async fn generate(
     prompt: &str,
     env: &EnvSummary,
     cfg: &Config,
-) -> Result<(LlmDraft, Usage), AshError> {
+) -> Result<(LlmDraft, TokenUsage), AshError> {
+    if use_responses_api(cfg) {
+        return generate_responses(prompt, env, cfg).await;
+    }
+
     let client = build_client(cfg)?;
     let system = format!(
         "You are an expert CLI assistant. Your sole purpose is to translate the user's natural language request into a valid shell command based on their environment.\n\n\
@@ -59,6 +72,109 @@ pub async fn generate(
         .trim()
         .to_string();
     let draft = parse_draft(&text)?;
+    Ok((
+        draft,
+        TokenUsage {
+            prompt_tokens: usage.prompt_tokens.map(|v| v as u64),
+            completion_tokens: usage.completion_tokens.map(|v| v as u64),
+            total_tokens: usage.total_tokens.map(|v| v as u64),
+        },
+    ))
+}
+
+fn use_responses_api(cfg: &Config) -> bool {
+    openai_api_mode(
+        &cfg.api_type,
+        &cfg.model_name,
+        std::env::var("ASH_OPENAI_API_MODE").ok().as_deref(),
+    )
+}
+
+fn openai_api_mode(api_type: &str, model_name: &str, override_mode: Option<&str>) -> bool {
+    if !api_type.eq_ignore_ascii_case("openai") {
+        return false;
+    }
+    match override_mode {
+        Some("chat") => false,
+        Some("responses") => true,
+        _ => model_name.to_ascii_lowercase().starts_with("gpt-5"),
+    }
+}
+
+async fn generate_responses(
+    prompt: &str,
+    env: &EnvSummary,
+    cfg: &Config,
+) -> Result<(LlmDraft, TokenUsage), AshError> {
+    let system = format!(
+        "You are an expert CLI assistant. Translate the user's request into one valid shell command for the detected environment. Return only the JSON object required by the response schema. Never add Markdown or prose.\n\nENVIRONMENT:\n{}",
+        env.text
+    );
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "command": { "type": "string" },
+            "explanation": { "type": ["string", "null"] }
+        },
+        "required": ["command", "explanation"]
+    });
+    let mut body = serde_json::json!({
+        "model": cfg.model_name.as_str(),
+        "instructions": system,
+        "input": prompt,
+        "text": { "format": { "type": "json_schema", "name": "shell_command", "strict": true, "schema": schema } }
+    });
+    if let Some(effort) = std::env::var("ASH_REASONING_EFFORT").ok().filter(|v| !v.is_empty()) {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    let endpoint = cfg
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .trim_end_matches('/')
+        .to_owned()
+        + "/responses";
+    let client = reqwest::Client::new();
+    let response = timeout(
+        Duration::from_secs(cfg.request_timeout_secs),
+        client.post(endpoint).bearer_auth(&cfg.api_key).json(&body).send(),
+    )
+    .await
+    .map_err(|_| AshError::Timeout(format!("request timed out after {}s", cfg.request_timeout_secs)))?
+    .map_err(|e| AshError::NetworkError(e.to_string()))?;
+    let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| AshError::NetworkError(format!("invalid API response: {e}")))?;
+    if !status.is_success() {
+        let message = payload["error"]["message"]
+            .as_str()
+            .unwrap_or("OpenAI Responses API request failed");
+        return Err(AshError::NetworkError(format!("HTTP {status}: {message}")));
+    }
+    parse_responses_payload(&payload)
+}
+
+fn parse_responses_payload(payload: &serde_json::Value) -> Result<(LlmDraft, TokenUsage), AshError> {
+    let text = payload["output_text"]
+        .as_str()
+        .or_else(|| {
+            payload["output"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                .find_map(|part| part["text"].as_str())
+        })
+        .ok_or_else(|| AshError::LlmOutputError("no text in Responses API output".into()))?;
+    let draft = parse_draft(text.trim())?;
+    let usage = TokenUsage {
+        prompt_tokens: payload["usage"]["input_tokens"].as_u64(),
+        completion_tokens: payload["usage"]["output_tokens"].as_u64(),
+        total_tokens: payload["usage"]["total_tokens"].as_u64(),
+    };
     Ok((draft, usage))
 }
 
@@ -138,7 +254,7 @@ fn build_client(cfg: &Config) -> Result<Client, AshError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_draft;
+    use super::{openai_api_mode, parse_draft, parse_responses_payload};
     use crate::error::AshError;
 
     #[test]
@@ -198,5 +314,29 @@ mod tests {
     fn escaped_quote_in_string() {
         let d = parse_draft(r#"{"command":"echo \"hello\"","explanation":"x"}"#).unwrap();
         assert_eq!(d.command, r#"echo "hello""#);
+    }
+
+    #[test]
+    fn gpt5_openai_uses_responses_by_default() {
+        assert!(openai_api_mode("openai", "gpt-5.6", None));
+        assert!(!openai_api_mode("deepseek", "gpt-5.6", None));
+        assert!(!openai_api_mode("openai", "gpt-4o-mini", None));
+        assert!(!openai_api_mode("openai", "gpt-5.6", Some("chat")));
+        assert!(openai_api_mode("openai", "gpt-4o-mini", Some("responses")));
+    }
+
+    #[test]
+    fn responses_payload_parses_output_and_usage() {
+        let payload = serde_json::json!({
+            "output": [{
+                "content": [{"type": "output_text", "text": r#"{"command":"git status","explanation":"show status"}"#}]
+            }],
+            "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+        });
+        let (draft, usage) = parse_responses_payload(&payload).unwrap();
+        assert_eq!(draft.command, "git status");
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(20));
     }
 }

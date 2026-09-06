@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-genai = "0.7.0-beta.4"
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time"] }
+genai = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "0.9"
 dirs = "6"
 crossterm = "0.29"
 shlex = "2"
 which = "8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

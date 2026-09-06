@@ -4,11 +4,13 @@
 
 # Required
 api_type      = "openai"          # openai | anthropic | gemini | ollama | groq | cohere | deepseek | xai
-api_key       = "sk-..."          # your API key (or omit and set ASH_API_KEY env var)
-model_name    = "gpt-4o-mini"     # model to use
+api_key       = "sk-..."          # your API key (or omit and set ASH_API_KEY/provider env var)
+model_name    = "gpt-5.6"          # latest GPT-5 family; uses Responses API automatically
 
 # Optional: override the default API endpoint (e.g. for proxies or local models)
 # base_url = "https://my-proxy.example.com/v1"
+# OpenAI mode override (optional): ASH_OPENAI_API_MODE=chat|responses
+# Reasoning control for GPT-5 models (optional): ASH_REASONING_EFFORT=low|medium|high
 
 # Commands that are allowed to run (empty = all commands allowed)
 allow_list = ["ls", "cat", "git", "echo", "curl"]

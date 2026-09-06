@@ -105,19 +105,39 @@ fn find_config() -> Result<PathBuf, crate::error::AshError> {
 }
 
 fn validate(mut cfg: Config) -> Result<Config, crate::error::AshError> {
-    // Allow the API key to be supplied via environment variable instead of the config file.
-    if let Some(key) = std::env::var("ASH_API_KEY").ok().filter(|k| !k.is_empty()) {
+    // Allow the API key to be supplied via a generic or provider-specific env var.
+    // The generic name wins so CI and local overrides behave predictably.
+    let provider_env = match cfg.api_type.to_ascii_lowercase().as_str() {
+        "openai" => "OPENAI_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "xai" => "XAI_API_KEY",
+        _ => "",
+    };
+    let env_key = std::env::var("ASH_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            (!provider_env.is_empty())
+                .then(|| std::env::var(provider_env).ok())
+                .flatten()
+                .filter(|k| !k.is_empty())
+        });
+    if let Some(key) = env_key {
         cfg.api_key = key;
     }
     let inv = |f: &str| crate::error::AshError::InvalidConfig(format!("{f} must not be empty"));
-    for (val, name) in [
-        (cfg.api_type.as_str(), "api_type"),
-        (cfg.api_key.as_str(), "api_key"),
-        (cfg.model_name.as_str(), "model_name"),
-    ] {
+    for (val, name) in [(cfg.api_type.as_str(), "api_type"), (cfg.model_name.as_str(), "model_name")] {
         if val.is_empty() {
             return Err(inv(name));
         }
+    }
+    // Local Ollama servers do not require authentication; hosted providers do.
+    if cfg.api_key.is_empty() && !cfg.api_type.eq_ignore_ascii_case("ollama") {
+        return Err(inv("api_key"));
     }
     if cfg.request_timeout_secs == 0 {
         return Err(crate::error::AshError::InvalidConfig(
